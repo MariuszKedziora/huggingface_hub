@@ -45,7 +45,6 @@ from huggingface_hub.inference._common import (
     ContentT,
     ModelStatus,
     _async_stream_chat_completion_response_from_bytes,
-    _async_stream_chat_completion_response_from_text_generation,
     _async_stream_text_generation_response,
     _b64_encode,
     _b64_to_image,
@@ -91,7 +90,6 @@ from huggingface_hub.inference._generated.types import (
     ZeroShotImageClassificationOutputElement,
 )
 from huggingface_hub.inference._generated.types.chat_completion import ChatCompletionInputToolTypeEnum
-from huggingface_hub.inference._templating import render_chat_prompt
 from huggingface_hub.inference._types import (
     ConversationalOutput,  # soon to be removed
 )
@@ -291,6 +289,9 @@ class AsyncInferenceClient:
                             timeout = max(self.timeout - (time.time() - t0), 1)  # type: ignore
                         continue
                     raise error
+                except Exception:
+                    await client.close()
+                    raise
 
     async def audio_classification(
         self,
@@ -437,6 +438,7 @@ class AsyncInferenceClient:
         tools: Optional[List[ChatCompletionInputTool]] = None,
         top_logprobs: Optional[int] = None,
         top_p: Optional[float] = None,
+        model_id: Optional[str] = None,
     ) -> ChatCompletionOutput: ...
 
     @overload
@@ -460,6 +462,7 @@ class AsyncInferenceClient:
         tools: Optional[List[ChatCompletionInputTool]] = None,
         top_logprobs: Optional[int] = None,
         top_p: Optional[float] = None,
+        model_id: Optional[str] = None,
     ) -> AsyncIterable[ChatCompletionStreamOutput]: ...
 
     @overload
@@ -483,6 +486,7 @@ class AsyncInferenceClient:
         tools: Optional[List[ChatCompletionInputTool]] = None,
         top_logprobs: Optional[int] = None,
         top_p: Optional[float] = None,
+        model_id: Optional[str] = None,
     ) -> Union[ChatCompletionOutput, AsyncIterable[ChatCompletionStreamOutput]]: ...
 
     async def chat_completion(
@@ -506,6 +510,7 @@ class AsyncInferenceClient:
         tools: Optional[List[ChatCompletionInputTool]] = None,
         top_logprobs: Optional[int] = None,
         top_p: Optional[float] = None,
+        model_id: Optional[str] = None,
     ) -> Union[ChatCompletionOutput, AsyncIterable[ChatCompletionStreamOutput]]:
         """
         A method for completing conversations using a specified language model.
@@ -570,6 +575,10 @@ class AsyncInferenceClient:
             tools (List of [`ChatCompletionInputTool`], *optional*):
                 A list of tools the model may call. Currently, only functions are supported as a tool. Use this to
                 provide a list of functions the model may generate JSON inputs for.
+            model_id (`str`, *optional*):
+                The model ID to use for chat-completion. Only used when `model` is a URL to a deployed Text Generation Inference server.
+                It is passed to the server as the `model` parameter. This parameter has no impact on the URL that will be used to
+                send the request.
 
         Returns:
             [`ChatCompletionOutput] or Iterable of [`ChatCompletionStreamOutput`]:
@@ -704,11 +713,20 @@ class AsyncInferenceClient:
             if not model_url.endswith("/chat/completions"):
                 model_url += "/v1/chat/completions"
 
+            # `model_id` sent in the payload. Not used by the server but can be useful for debugging/routing.
+            if model_id is None:
+                if not model.startswith("http") and model.count("/") == 1:
+                    # If it's a ID on the Hub => use it
+                    model_id = model
+                else:
+                    # Otherwise, we use a random string
+                    model_id = "tgi"
+
             try:
                 data = await self.post(
                     model=model_url,
                     json=dict(
-                        model="tgi",  # random string
+                        model=model_id,
                         messages=messages,
                         frequency_penalty=frequency_penalty,
                         logit_bias=logit_bias,
@@ -728,21 +746,26 @@ class AsyncInferenceClient:
                     ),
                     stream=stream,
                 )
-            except _import_aiohttp().ClientResponseError:
-                # Let's consider the server is not a chat completion server.
-                # Then we call again `chat_completion` which will render the chat template client side.
-                # (can be HTTP 500, HTTP 400, HTTP 404 depending on the server)
-                _set_as_non_chat_completion_server(model)
-                return await self.chat_completion(
-                    messages=messages,
-                    model=model,
-                    stream=stream,
-                    max_tokens=max_tokens,
-                    seed=seed,
-                    stop=stop,
-                    temperature=temperature,
-                    top_p=top_p,
-                )
+            except _import_aiohttp().ClientResponseError as e:
+                if e.status in (400, 404, 500):
+                    # Let's consider the server is not a chat completion server.
+                    # Then we call again `chat_completion` which will render the chat template client side.
+                    # (can be HTTP 500, HTTP 400, HTTP 404 depending on the server)
+                    _set_as_non_chat_completion_server(model)
+                    logger.warning(
+                        f"Server {model_url} does not seem to support chat completion. Falling back to text generation. Error: {e}"
+                    )
+                    return await self.chat_completion(
+                        messages=messages,
+                        model=model,
+                        stream=stream,
+                        max_tokens=max_tokens,
+                        seed=seed,
+                        stop=stop,
+                        temperature=temperature,
+                        top_p=top_p,
+                    )
+                raise
 
             if stream:
                 return _async_stream_chat_completion_response_from_bytes(data)  # type: ignore[arg-type]
@@ -750,44 +773,25 @@ class AsyncInferenceClient:
             return ChatCompletionOutput.parse_obj_as_instance(data)  # type: ignore[arg-type]
 
         # At this point, we know the server is not a chat completion server.
-        # We need to render the chat template client side based on the information we can fetch from
-        # the Hub API.
-
-        model_id = None
-        if model.startswith(("http://", "https://")):
-            # If URL, we need to know which model is served. This is not always possible.
-            # A workaround is to list the user Inference Endpoints and check if one of them correspond to the model URL.
-            # If not, we raise an error.
-            # TODO: fix when we have a proper API for this (at least for Inference Endpoints)
-            # TODO: what if Sagemaker URL?
-            # TODO: what if Azure URL?
-            from ..hf_api import HfApi
-
-            for endpoint in HfApi(token=self.token).list_inference_endpoints():
-                if endpoint.url == model:
-                    model_id = endpoint.repository
-                    break
-        else:
-            model_id = model
-
-        if model_id is None:
-            # If we don't have the model ID, we can't fetch the chat template.
-            # We raise an error.
+        # It means it's a transformers-backed server for which we can send a list of messages directly to the
+        # `text-generation` pipeline. We won't receive a detailed response but only the generated text.
+        if stream:
             raise ValueError(
-                "Request can't be processed as the model ID can't be inferred from model URL. "
-                "This is needed to fetch the chat template from the Hub since the model is not "
-                "served with a Chat-completion API."
+                "Streaming token is not supported by the model. This is due to the model not been served by a "
+                "Text-Generation-Inference server. Please pass `stream=False` as input."
             )
-
-        # fetch chat template + tokens
-        prompt = render_chat_prompt(model_id=model_id, token=self.token, messages=messages)
+        if tool_choice is not None or tool_prompt is not None or tools is not None:
+            warnings.warn(
+                "Tools are not supported by the model. This is due to the model not been served by a "
+                "Text-Generation-Inference server. The provided tool parameters will be ignored."
+            )
 
         # generate response
         text_generation_output = await self.text_generation(
-            prompt=prompt,
-            details=True,
-            stream=stream,
+            prompt=messages,  # type: ignore # Not correct type but works implicitly
             model=model,
+            stream=False,
+            details=False,
             max_new_tokens=max_tokens,
             seed=seed,
             stop_sequences=stop,
@@ -795,34 +799,20 @@ class AsyncInferenceClient:
             top_p=top_p,
         )
 
-        created = int(time.time())
-
-        if stream:
-            return _async_stream_chat_completion_response_from_text_generation(text_generation_output)  # type: ignore [arg-type]
-
-        if isinstance(text_generation_output, TextGenerationOutput):
-            # General use case => format ChatCompletionOutput from text generation details
-            content: str = text_generation_output.generated_text
-            finish_reason: str = text_generation_output.details.finish_reason  # type: ignore[union-attr]
-        else:
-            # Corner case: if server doesn't support details (e.g. if not a TGI server), we only receive an output string.
-            # In such a case, `finish_reason` is set to `"unk"`.
-            content = text_generation_output  # type: ignore[assignment]
-            finish_reason = "unk"
-
+        # Format as a ChatCompletionOutput with dummy values for fields we can't provide
         return ChatCompletionOutput(
             id="dummy",
             model="dummy",
             object="dummy",
             system_fingerprint="dummy",
-            usage=None,  # type: ignore # set to None as we don't want to provide fake information
-            created=created,
+            usage=None,  # type: ignore # set to `None` as we don't want to provide false information
+            created=int(time.time()),
             choices=[
                 ChatCompletionOutputComplete(
-                    finish_reason=finish_reason,  # type: ignore
+                    finish_reason="unk",  # type: ignore # set to `unk` as we don't want to provide false information
                     index=0,
                     message=ChatCompletionOutputMessage(
-                        content=content,
+                        content=text_generation_output,
                         role="assistant",
                     ),
                 )
@@ -945,7 +935,14 @@ class AsyncInferenceClient:
         response = await self.post(json=payload, model=model, task="document-question-answering")
         return DocumentQuestionAnsweringOutputElement.parse_obj_as_list(response)
 
-    async def feature_extraction(self, text: str, *, model: Optional[str] = None) -> "np.ndarray":
+    async def feature_extraction(
+        self,
+        text: str,
+        *,
+        normalize: Optional[bool] = None,
+        truncate: Optional[bool] = None,
+        model: Optional[str] = None,
+    ) -> "np.ndarray":
         """
         Generate embeddings for a given text.
 
@@ -956,6 +953,12 @@ class AsyncInferenceClient:
                 The model to use for the conversational task. Can be a model ID hosted on the Hugging Face Hub or a URL to
                 a deployed Inference Endpoint. If not provided, the default recommended conversational model will be used.
                 Defaults to None.
+            normalize (`bool`, *optional*):
+                Whether to normalize the embeddings or not. Defaults to None.
+                Only available on server powered by Text-Embedding-Inference.
+            truncate (`bool`, *optional*):
+                Whether to truncate the embeddings or not. Defaults to None.
+                Only available on server powered by Text-Embedding-Inference.
 
         Returns:
             `np.ndarray`: The embedding representing the input text as a float32 numpy array.
@@ -978,7 +981,12 @@ class AsyncInferenceClient:
         [ 0.28552425, -0.928395  , -1.2077185 , ...,  0.76810825, -2.1069427 ,  0.6236161 ]], dtype=float32)
         ```
         """
-        response = await self.post(json={"inputs": text}, model=model, task="feature-extraction")
+        payload: Dict = {"inputs": text}
+        if normalize is not None:
+            payload["normalize"] = normalize
+        if truncate is not None:
+            payload["truncate"] = truncate
+        response = await self.post(json=payload, model=model, task="feature-extraction")
         np = _import_numpy()
         return np.array(_bytes_to_dict(response), dtype="float32")
 
@@ -1222,7 +1230,8 @@ class AsyncInferenceClient:
         ```
         """
         response = await self.post(data=image, model=model, task="image-to-text")
-        return ImageToTextOutput.parse_obj_as_instance(response)
+        output = ImageToTextOutput.parse_obj(response)
+        return output[0] if isinstance(output, list) else output
 
     async def list_deployed_models(
         self, frameworks: Union[None, str, Literal["all"], List[str]] = None
@@ -1842,6 +1851,13 @@ class AsyncInferenceClient:
 
         To learn more about the TGI project, please refer to https://github.com/huggingface/text-generation-inference.
 
+        <Tip>
+
+        If you want to generate a response from chat messages, you should use the [`InferenceClient.chat_completion`] method.
+        It accepts a list of messages instead of a single text prompt and handles the chat templating for you.
+
+        </Tip>
+
         Args:
             prompt (`str`):
                 Input text.
@@ -2027,6 +2043,7 @@ class AsyncInferenceClient:
         parameters = {
             "best_of": best_of,
             "decoder_input_details": decoder_input_details,
+            "details": details,
             "do_sample": do_sample,
             "frequency_penalty": frequency_penalty,
             "grammar": grammar,
@@ -2582,6 +2599,99 @@ class AsyncInferenceClient:
                 " explicitly. Visit https://huggingface.co/tasks for more info."
             )
         return model
+
+    async def get_endpoint_info(self, *, model: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Get information about the deployed endpoint.
+
+        This endpoint is only available on endpoints powered by Text-Generation-Inference (TGI) or Text-Embedding-Inference (TEI).
+        Endpoints powered by `transformers` return an empty payload.
+
+        Args:
+            model (`str`, *optional*):
+                The model to use for inference. Can be a model ID hosted on the Hugging Face Hub or a URL to a deployed
+                Inference Endpoint. This parameter overrides the model defined at the instance level. Defaults to None.
+
+        Returns:
+            `Dict[str, Any]`: Information about the endpoint.
+
+        Example:
+        ```py
+        # Must be run in an async context
+        >>> from huggingface_hub import AsyncInferenceClient
+        >>> client = AsyncInferenceClient("meta-llama/Meta-Llama-3-70B-Instruct")
+        >>> await client.get_endpoint_info()
+        {
+            'model_id': 'meta-llama/Meta-Llama-3-70B-Instruct',
+            'model_sha': None,
+            'model_dtype': 'torch.float16',
+            'model_device_type': 'cuda',
+            'model_pipeline_tag': None,
+            'max_concurrent_requests': 128,
+            'max_best_of': 2,
+            'max_stop_sequences': 4,
+            'max_input_length': 8191,
+            'max_total_tokens': 8192,
+            'waiting_served_ratio': 0.3,
+            'max_batch_total_tokens': 1259392,
+            'max_waiting_tokens': 20,
+            'max_batch_size': None,
+            'validation_workers': 32,
+            'max_client_batch_size': 4,
+            'version': '2.0.2',
+            'sha': 'dccab72549635c7eb5ddb17f43f0b7cdff07c214',
+            'docker_label': 'sha-dccab72'
+        }
+        ```
+        """
+        model = model or self.model
+        if model is None:
+            raise ValueError("Model id not provided.")
+        if model.startswith(("http://", "https://")):
+            url = model.rstrip("/") + "/info"
+        else:
+            url = f"{INFERENCE_ENDPOINT}/models/{model}/info"
+
+        async with _import_aiohttp().ClientSession(headers=self.headers) as client:
+            response = await client.get(url)
+            response.raise_for_status()
+            return await response.json()
+
+    async def health_check(self, model: Optional[str] = None) -> bool:
+        """
+        Check the health of the deployed endpoint.
+
+        Health check is only available with Inference Endpoints powered by Text-Generation-Inference (TGI) or Text-Embedding-Inference (TEI).
+        For Inference API, please use [`InferenceClient.get_model_status`] instead.
+
+        Args:
+            model (`str`, *optional*):
+                URL of the Inference Endpoint. This parameter overrides the model defined at the instance level. Defaults to None.
+
+        Returns:
+            `bool`: True if everything is working fine.
+
+        Example:
+        ```py
+        # Must be run in an async context
+        >>> from huggingface_hub import AsyncInferenceClient
+        >>> client = AsyncInferenceClient("https://jzgu0buei5.us-east-1.aws.endpoints.huggingface.cloud")
+        >>> await client.health_check()
+        True
+        ```
+        """
+        model = model or self.model
+        if model is None:
+            raise ValueError("Model id not provided.")
+        if not model.startswith(("http://", "https://")):
+            raise ValueError(
+                "Model must be an Inference Endpoint URL. For serverless Inference API, please use `InferenceClient.get_model_status`."
+            )
+        url = model.rstrip("/") + "/health"
+
+        async with _import_aiohttp().ClientSession(headers=self.headers) as client:
+            response = await client.get(url)
+            return response.status == 200
 
     async def get_model_status(self, model: Optional[str] = None) -> ModelStatus:
         """

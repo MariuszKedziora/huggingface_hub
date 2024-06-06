@@ -30,6 +30,7 @@ from huggingface_hub import (
     DocumentQuestionAnsweringOutputElement,
     FillMaskOutputElement,
     ImageClassificationOutputElement,
+    ImageToTextOutput,
     InferenceClient,
     ObjectDetectionOutputElement,
     QuestionAnsweringOutputElement,
@@ -58,6 +59,7 @@ _RECOMMENDED_MODELS_FOR_VCR = {
     "document-question-answering": "naver-clova-ix/donut-base-finetuned-docvqa",
     "feature-extraction": "facebook/bart-base",
     "image-classification": "google/vit-base-patch16-224",
+    "image-to-text": "Salesforce/blip-image-captioning-base",
     "image-segmentation": "facebook/detr-resnet-50-panoptic",
     "object-detection": "facebook/detr-resnet-50",
     "sentence-similarity": "sentence-transformers/all-MiniLM-L6-v2",
@@ -326,6 +328,19 @@ class InferenceClientVCRTest(InferenceClientTest):
             "location": "San Francisco, CA",
         }
 
+    def test_chat_completion_unprocessable_entity(self) -> None:
+        """Regression test for #2225.
+
+        See https://github.com/huggingface/huggingface_hub/issues/2225.
+        """
+        with self.assertRaises(HfHubHTTPError):
+            self.client.chat_completion(
+                "please output 'Observation'",  # Not a list of messages
+                stop=["Observation", "Final Answer"],
+                max_tokens=200,
+                model="meta-llama/Meta-Llama-3-70B-Instruct",
+            )
+
     @expect_deprecation("InferenceClient.conversational")
     def test_conversational(self) -> None:
         output = self.client.conversational("Hi, who are you?")
@@ -457,11 +472,10 @@ class InferenceClientVCRTest(InferenceClientTest):
     #     self.assertEqual(image.height, 512)
     #     self.assertEqual(image.width, 512)
 
-    # ERROR 500 from server
-    # Only during tests, not when running locally. Has to be investigated.
-    # def test_image_to_text(self) -> None:
-    #     caption = self.client.image_to_text(self.image_file)
-    #     self.assertEqual(caption, "")
+    def test_image_to_text(self) -> None:
+        caption = self.client.image_to_text(self.image_file)
+        assert isinstance(caption, ImageToTextOutput)
+        assert caption.generated_text == "a woman in a hat and dress posing for a photo"
 
     def test_object_detection(self) -> None:
         output = self.client.object_detection(self.image_file)

@@ -395,6 +395,7 @@ def _lfs_log_progress():
                         unit="B",
                         unit_scale=True,
                         unit_divisor=1024,
+                        name="huggingface_hub.lfs_upload",
                     ),
                     "past_bytes": int(current_bytes),
                 }
@@ -506,8 +507,8 @@ class Repository:
                 instance will be created if this is left to `None`.
 
         Raises:
-            - [`EnvironmentError`](https://docs.python.org/3/library/exceptions.html#EnvironmentError)
-              if the remote repository set in `clone_from` does not exist.
+            [`EnvironmentError`](https://docs.python.org/3/library/exceptions.html#EnvironmentError)
+                If the remote repository set in `clone_from` does not exist.
         """
         if isinstance(local_dir, Path):
             local_dir = str(local_dir)
@@ -579,8 +580,8 @@ class Repository:
         Checks that `git` and `git-lfs` can be run.
 
         Raises:
-            - [`EnvironmentError`](https://docs.python.org/3/library/exceptions.html#EnvironmentError)
-              if `git` or `git-lfs` are not installed.
+            [`EnvironmentError`](https://docs.python.org/3/library/exceptions.html#EnvironmentError)
+                If `git` or `git-lfs` are not installed.
         """
         try:
             git_version = run_subprocess("git --version", self.local_dir).stdout.strip()

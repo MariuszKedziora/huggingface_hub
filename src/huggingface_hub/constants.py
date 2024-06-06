@@ -93,6 +93,9 @@ DISCUSSION_TYPES: Tuple[DiscussionTypeFilter, ...] = typing.get_args(DiscussionT
 DiscussionStatusFilter = Literal["all", "open", "closed"]
 DISCUSSION_STATUS: Tuple[DiscussionTypeFilter, ...] = typing.get_args(DiscussionStatusFilter)
 
+# Webhook subscription types
+WEBHOOK_DOMAIN_T = Literal["repo", "discussions"]
+
 # default cache
 default_home = os.path.join(os.path.expanduser("~"), ".cache")
 HF_HOME = os.path.expanduser(
@@ -163,9 +166,8 @@ HF_HUB_DISABLE_IMPLICIT_TOKEN: bool = _is_true(os.environ.get("HF_HUB_DISABLE_IM
 HF_HUB_ENABLE_HF_TRANSFER: bool = _is_true(os.environ.get("HF_HUB_ENABLE_HF_TRANSFER"))
 
 
-# Used if download to `local_dir` and `local_dir_use_symlinks="auto"`
-# Files smaller than 5MB are copy-pasted while bigger files are symlinked. The idea is to save disk-usage by symlinking
-# huge files (i.e. LFS files most of the time) while allowing small files to be manually edited in local folder.
+# UNUSED
+# We don't use symlinks in local dir anymore.
 HF_HUB_LOCAL_DIR_AUTO_SYMLINK_THRESHOLD: int = (
     _as_int(os.environ.get("HF_HUB_LOCAL_DIR_AUTO_SYMLINK_THRESHOLD")) or 5 * 1024 * 1024
 )

@@ -65,6 +65,9 @@ def generate_async_client_code(code: str) -> str:
     # Adapt list_deployed_models
     code = _adapt_list_deployed_models(code)
 
+    # Adapt /info and /health endpoints
+    code = _adapt_info_and_health_endpoints(code)
+
     return code
 
 
@@ -233,7 +236,10 @@ ASYNC_POST_CODE = """
                         if timeout is not None:
                             timeout = max(self.timeout - (time.time() - t0), 1)  # type: ignore
                         continue
-                    raise error"""
+                    raise error
+                except Exception:
+                    await client.close()
+                    raise"""
 
 
 def _make_post_async(code: str) -> str:
@@ -335,8 +341,10 @@ def _adapt_text_generation_to_async(code: str) -> str:
 def _adapt_chat_completion_to_async(code: str) -> str:
     # Catch `aiohttp` error instead of `requests` error
     code = code.replace(
-        "except HTTPError:",
-        "except _import_aiohttp().ClientResponseError:",
+        """            except HTTPError as e:
+                if e.response.status_code in (400, 404, 500):""",
+        """            except _import_aiohttp().ClientResponseError as e:
+                if e.status in (400, 404, 500):""",
     )
 
     # Await text-generation call
@@ -405,10 +413,6 @@ def _use_async_streaming_util(code: str) -> str:
         "_async_stream_text_generation_response",
     )
     code = code.replace(
-        "_stream_chat_completion_response_from_text_generation",
-        "_async_stream_chat_completion_response_from_text_generation",
-    )
-    code = code.replace(
         "_stream_chat_completion_response_from_bytes", "_async_stream_chat_completion_response_from_bytes"
     )
     return code
@@ -448,6 +452,32 @@ def _adapt_list_deployed_models(code: str) -> str:
         await asyncio.gather(*[_fetch_framework(framework) for framework in frameworks])""".strip()
 
     return code.replace(sync_snippet, async_snippet)
+
+
+def _adapt_info_and_health_endpoints(code: str) -> str:
+    info_sync_snippet = """
+        response = get_session().get(url, headers=self.headers)
+        hf_raise_for_status(response)
+        return response.json()"""
+
+    info_async_snippet = """
+        async with _import_aiohttp().ClientSession(headers=self.headers) as client:
+            response = await client.get(url)
+            response.raise_for_status()
+            return await response.json()"""
+
+    code = code.replace(info_sync_snippet, info_async_snippet)
+
+    health_sync_snippet = """
+        response = get_session().get(url, headers=self.headers)
+        return response.status_code == 200"""
+
+    health_async_snippet = """
+        async with _import_aiohttp().ClientSession(headers=self.headers) as client:
+            response = await client.get(url)
+            return response.status == 200"""
+
+    return code.replace(health_sync_snippet, health_async_snippet)
 
 
 if __name__ == "__main__":

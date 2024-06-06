@@ -19,6 +19,7 @@ from .constants import ENDPOINT, HF_HUB_ENABLE_HF_TRANSFER
 from .file_download import hf_hub_url
 from .lfs import UploadInfo, lfs_upload, post_lfs_batch_info
 from .utils import (
+    FORBIDDEN_FOLDERS,
     EntryNotFoundError,
     chunk_iterable,
     get_session,
@@ -254,11 +255,12 @@ def _validate_path_in_repo(path_in_repo: str) -> str:
         raise ValueError(f"Invalid `path_in_repo` in CommitOperation: '{path_in_repo}'")
     if path_in_repo.startswith("./"):
         path_in_repo = path_in_repo[2:]
-    if any(part == ".git" for part in path_in_repo.split("/")):
-        raise ValueError(
-            "Invalid `path_in_repo` in CommitOperation: cannot update files under a '.git/' folder (path:"
-            f" '{path_in_repo}')."
-        )
+    for forbidden in FORBIDDEN_FOLDERS:
+        if any(part == forbidden for part in path_in_repo.split("/")):
+            raise ValueError(
+                f"Invalid `path_in_repo` in CommitOperation: cannot update files under a '{forbidden}/' folder (path:"
+                f" '{path_in_repo}')."
+            )
     return path_in_repo
 
 
@@ -343,13 +345,13 @@ def _upload_lfs_files(
         revision (`str`, *optional*):
             The git revision to upload to.
 
-    Raises: `RuntimeError` if an upload failed for any reason
-
-    Raises: `ValueError` if the server returns malformed responses
-
-    Raises: `requests.HTTPError` if the LFS batch endpoint returned an HTTP
-        error
-
+    Raises:
+        [`EnvironmentError`](https://docs.python.org/3/library/exceptions.html#EnvironmentError)
+            If an upload failed for any reason
+        [`ValueError`](https://docs.python.org/3/library/exceptions.html#ValueError)
+            If the server returns malformed responses
+        [`HTTPError`](https://requests.readthedocs.io/en/latest/api/#requests.HTTPError)
+            If the LFS batch endpoint returned an HTTP error.
     """
     # Step 1: retrieve upload instructions from the LFS batch endpoint.
     #         Upload instructions are retrieved by chunk of 256 files to avoid reaching
@@ -404,7 +406,7 @@ def _upload_lfs_files(
 
     if HF_HUB_ENABLE_HF_TRANSFER:
         logger.debug(f"Uploading {len(filtered_actions)} LFS files to the Hub using `hf_transfer`.")
-        for action in hf_tqdm(filtered_actions):
+        for action in hf_tqdm(filtered_actions, name="huggingface_hub.lfs_upload"):
             _wrapped_lfs_upload(action)
     elif len(filtered_actions) == 1:
         logger.debug("Uploading 1 LFS file to the Hub")
